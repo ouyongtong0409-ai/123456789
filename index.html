@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Andromeda Galaxy</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; user-select: none; }
+        canvas { display: block; }
+        #ui {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.4);
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            pointer-events: none;
+        }
+    </style>
+    <!-- Load Three.js from a reliable CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body>
+    <div id="ui">
+        DRAG to Orbit | SCROLL to Zoom<br>
+        Auto-Approach: ACTIVE
+    </div>
+
+<script>
+/**
+ * CONFIGURATION
+ */
+const CONFIG = {
+    // Galaxy Settings
+    starCount: 25000,
+    galaxyRadius: 40.0,
+    armCount: 2,           // Two main arms for Andromeda-like look
+    armWinding: 2.5,       // How tight they wind
+    coreRadius: 6.0,       // Bright core size
+    thickness: 3.0,        // Z-height thickness
+    colorCore: 0xfff0d0,   // Warm white
+    colorArm: 0x90b0ff,    // Cold blueish
+    
+    // Background Settings
+    bgStarCount: 10000,
+    bgRadius: 250,
+
+    // Camera / Interaction
+    minDist: 8.0,
+    maxDist: 80.0,
+    autoSpeed: 0.8,        // Units per second
+    damping: 0.08,
+    idleTime: 1500         // ms to wait before auto-move
+};
+
+/**
+ * SHADERS
+ * Custom shaders to prevent "square points" and control exposure
+ */
+
+const vertexShader = `
+    attribute float size;
+    attribute vec3 color;
+    attribute float alpha;
+    
+    varying vec3 vColor;
+    varying float vAlpha;
+    varying float vDist;
+
+    void main() {
+        vColor = color;
+        vAlpha = alpha;
+        
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        vDist = -mvPosition.z;
+        
+        // Size attenuation: scale by distance
+        // clamp ensures stars don't become massive blobs when close
+        float outputSize = size * (350.0 / vDist);
+        gl_PointSize = clamp(outputSize, 0.5, 4.0);
+        
+        gl_Position = projectionMatrix * mvPosition;
+    }
+`;
+
+const fragmentShader = `
+    varying vec3 vColor;
+    varying float vAlpha;
+    varying float vDist;
+
+    void main() {
+        // 1. Draw Circle (Soft Edge)
+        vec2 coord = gl_PointCoord - vec2(0.5);
+        float dist = length(coord);
+        
+        // Discard corners to make it round
+        if (dist > 0.5) discard;
+        
+        // 2. Soft glow gradient
+        // Center is solid, edge is soft
+        float strength = 1.0 - smoothstep(0.3, 0.5, dist);
+        
+        // 3. Distance fading (optional, helps depth)
+        float fog = clamp(1.0 - (vDist / 400.0), 0.0, 1.0);
+        
+        // 4. Tone Mapping simulation in shader
+        // Prevent over-exposure by clamping max brightness of a single fragment
+        vec3 finalColor = vColor * strength;
+        
+        gl_FragColor = vec4(finalColor, vAlpha * strength * fog);
+    }
+`;
+
+/**
+ * MAIN APP
+ */
+class App {
+    constructor() {
+        this.initThree();
+        this.initGalaxy();
+        this.initBackground();
+        this.initControls();
+        this.animate();
+        
+        window.addEventListener('resize', this.onResize.bind(this));
+    }
+
+    initThree() {
+        this.scene = new THREE.Scene();
+        // Slight exponential fog for depth
+        this.scene.fog = new THREE.FogExp2(0x000000, 0.0015);
+
+        this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        this.camera.position.set(0, 15, 50);
+
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(this.renderer.domElement);
+        
+        this.clock = new THREE.Clock();
+    }
+
+    initGalaxy() {
+        const { starCount, galaxyRadius, thickness, armCount, armWinding } = CONFIG;
+        
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(starCount * 3);
+        const colors = new Float32Array(starCount * 3);
+        const sizes = new Float32Array(starCount);
+        const alphas = new Float32Array(starCount);
+        
+        const colorC = new THREE.Color(CONFIG.colorCore);
+        const colorA = new THREE.Color(CONFIG.colorArm);
+        const tempColor = new THREE.Color();
+
+        for (let i = 0; i < starCount; i++) {
+            const i3 = i * 3;
+            
+            // 0 -> 1 normalized radius, powered to concentrate stars in center
+            const rNorm = Math.random();
+            const rPow = Math.pow(rNorm, 1.5); // Core density
+            const r = rPow * galaxyRadius;
+
+            // Spiral Angle
+            const spinAngle = r * armWinding;
+            const branchAngle = (i % armCount) * ((Math.PI * 2) / armCount);
+            
+            // Randomness (scattering)
+            // More scatter at edges, less at core
+            const scatter = Math.max(0.5, r * 0.4); 
+            const rndX = (Math.random() - 0.5) * scatter;
+            const rndY = (Math.random() - 0.5) * scatter * 0.5; // Flatter in Y
+            const rndZ = (Math.random() - 0.5) * scatter;
+
+            const angle = spinAngle + branchAngle;
+            
+            // Polar to Cartesian
+            const x = Math.cos(angle) * r + rndX;
+            const z = Math.sin(angle) * r + rndZ;
+            // Thickness (Gaussian-ish distribution on Y)
+            const y = (Math.random() - 0.5) * thickness * (1.0 - rPow * 0.5) + rndY;
+
+            positions[i3] = x;
+            positions[i3+1] = y;
+            positions[i3+2] = z;
+
+            // Color Gradient
+            // Mix based on radius
+            const mixVal = Math.min(1.0, r / (galaxyRadius * 0.6));
+            tempColor.lerpColors(colorC, colorA, mixVal);
+            
+            // Add slight random variation
+            if (Math.random() > 0.8) tempColor.offsetHSL(0, 0, 0.1); 
+
+            colors[i3] = tempColor.r;
+            colors[i3+1] = tempColor.g;
+            colors[i3+2] = tempColor.b;
+
+            // Size: Core stars bigger? Actually usually smaller but denser.
+            // Let's randomize.
+            sizes[i] = Math.random() * 1.5 + 0.5;
+            
+            // Alpha: Core brighter
+            alphas[i] = 0.6 + Math.random() * 0.4;
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending // Additive for glow, but shader clamps brightness
+        });
+
+        this.galaxyPoints = new THREE.Points(geometry, material);
+        // Tilt the whole galaxy
+        this.galaxyPoints.rotation.x = 0.4; 
+        this.galaxyPoints.rotation.z = 0.2;
+        this.scene.add(this.galaxyPoints);
+    }
+
+    initBackground() {
+        const { bgStarCount, bgRadius } = CONFIG;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(bgStarCount * 3);
+        const colors = new Float32Array(bgStarCount * 3);
+        const sizes = new Float32Array(bgStarCount);
+        const alphas = new Float32Array(bgStarCount);
+
+        for (let i = 0; i < bgStarCount; i++) {
+            const i3 = i * 3;
+            // Uniform sphere
+            const r = bgRadius * (0.8 + Math.random() * 0.5);
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(2 * Math.random() - 1);
+
+            positions[i3] = r * Math.sin(phi) * Math.cos(theta);
+            positions[i3+1] = r * Math.sin(phi) * Math.sin(theta);
+            positions[i3+2] = r * Math.cos(phi);
+
+            // Cold / Dim colors
+            const c = 0.5 + Math.random() * 0.5;
+            colors[i3] = c;
+            colors[i3+1] = c;
+            colors[i3+2] = c * 1.2; // Blue tint
+
+            sizes[i] = Math.random() * 0.8 + 0.2; // Very small
+            alphas[i] = Math.random() * 0.5 + 0.1;
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+
+        this.bgPoints = new THREE.Points(geometry, material);
+        this.scene.add(this.bgPoints);
+    }
+
+    initControls() {
+        // Spherical Coordinates for Orbit
+        this.spherical = new THREE.Spherical();
+        this.spherical.setFromVector3(this.camera.position);
+        
+        this.targetSpherical = this.spherical.clone();
+        
+        this.lastInteraction = Date.now();
+        this.isDragging = false;
+        
+        // Mouse State
+        this.mouseX = 0;
+        this.mouseY = 0;
+
+        // Events
+        const canvas = this.renderer.domElement;
+        
+        canvas.addEventListener('mousedown', (e) => {
+            this.isDragging = true;
+            this.mouseX = e.clientX;
+            this.mouseY = e.clientY;
+            this.lastInteraction = Date.now();
+            this.updateUi("INTERACTING");
+        });
+
+        window.addEventListener('mouseup', () => {
+            this.isDragging = false;
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!this.isDragging) return;
+            
+            const dx = e.clientX - this.mouseX;
+            const dy = e.clientY - this.mouseY;
+            this.mouseX = e.clientX;
+            this.mouseY = e.clientY;
+
+            // Update Target Spherical
+            // Sensitivity
+            const sens = 0.005;
+            this.targetSpherical.theta -= dx * sens; // Horizontal (Infinite)
+            this.targetSpherical.phi -= dy * sens;   // Vertical
+
+            // Clamp vertical to prevent flipping (0.1 to PI-0.1)
+            this.targetSpherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, this.targetSpherical.phi));
+
+            this.lastInteraction = Date.now();
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const zoomSens = 0.05;
+            const zoomDelta = e.deltaY * zoomSens;
+            
+            this.targetSpherical.radius += zoomDelta;
+            this.targetSpherical.radius = Math.max(CONFIG.minDist, Math.min(CONFIG.maxDist, this.targetSpherical.radius));
+            
+            this.lastInteraction = Date.now();
+            this.updateUi("INTERACTING");
+        }, { passive: false });
+    }
+
+    updateUi(status) {
+        const ui = document.getElementById('ui');
+        if (status === "AUTO") ui.innerHTML = "DRAG to Orbit | SCROLL to Zoom<br>Auto-Approach: <span style='color:#8f8'>ACTIVE</span>";
+        else ui.innerHTML = "DRAG to Orbit | SCROLL to Zoom<br>Auto-Approach: <span style='color:#f88'>PAUSED</span>";
+    }
+
+    onResize() {
+        this.camera.aspect = window.innerWidth / window.innerHeight;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    animate() {
+        requestAnimationFrame(this.animate.bind(this));
+        
+        const dt = this.clock.getDelta();
+        const now = Date.now();
+
+        // 1. Auto Approach Logic
+        const timeSinceInteract = now - this.lastInteraction;
+        let isAuto = false;
+
+        if (!this.isDragging && timeSinceInteract > CONFIG.idleTime) {
+            // Check if we can move closer
+            if (this.targetSpherical.radius > CONFIG.minDist + 1.0) {
+                this.targetSpherical.radius -= CONFIG.autoSpeed * dt;
+                isAuto = true;
+            }
+        }
+        
+        // Update UI state occasionally
+        if (Math.random() > 0.95) {
+            this.updateUi(isAuto ? "AUTO" : "INTERACTING");
+        }
+
+        // 2. Damping / Interpolation
+        // Smoothly move actual spherical towards target spherical
+        // Lerp factor
+        const lerpFactor = 1.0 - Math.pow(0.001, dt); // Time-independent damping approximation
+
+        this.spherical.radius += (this.targetSpherical.radius - this.spherical.radius) * lerpFactor;
+        this.spherical.phi += (this.targetSpherical.phi - this.spherical.phi) * lerpFactor;
+        
+        // Theta wrapping for smooth infinite rotation
+        // We just lerp, but if difference is huge (crossing 0/360), standard lerp fails.
+        // However, for orbit controls, usually we just let values grow indefinitely.
+        this.spherical.theta += (this.targetSpherical.theta - this.spherical.theta) * lerpFactor;
+
+        // Apply to Camera
+        this.camera.position.setFromSpherical(this.spherical);
+        this.camera.lookAt(0, 0, 0);
+
+        // 3. Galaxy Idle Rotation
+        if (this.galaxyPoints) {
+            this.galaxyPoints.rotation.y += dt * 0.05;
+        }
+        
+        // 4. Background Parallax (Subtle)
+        if (this.bgPoints) {
+            this.bgPoints.rotation.y = this.spherical.theta * 0.05;
+        }
+
+        this.renderer.render(this.scene, this.camera);
+    }
+}
+
+// Start
+new App();
+
+</script>
+<script type="module" src="/index.tsx"></script>
+</body>
+</html>
